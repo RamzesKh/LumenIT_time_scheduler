@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createDefaultPeople,
   days,
@@ -6,28 +6,94 @@ import {
   type DayKey,
   type Person,
 } from "./availability";
+import {
+  TEAM_SCHEDULE_ROW_ID,
+  TEAM_SCHEDULE_TABLE,
+  supabase,
+} from "./supabase";
 
 const formatTimeHint = "Use 24-hour format like 09:00 and 17:30";
+const channelName = "lumenit-team-schedule";
 
-const STORAGE_KEY = "lumenit.people";
+type SyncState = "loading" | "live" | "offline" | "error";
+type RealtimeState =
+  | "connecting"
+  | "subscribed"
+  | "timed-out"
+  | "channel-error";
 
-const App = () => {
-  const [people, setPeople] = useState<Person[]>(() => {
-    try {
-      if (typeof window !== "undefined") {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          return JSON.parse(raw) as Person[];
-        }
-      }
-    } catch (e) {
-      // ignore and fall back
+const isDailyAvailability = (
+  value: unknown,
+): value is { start: string; end: string } => {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { start?: unknown }).start === "string" &&
+    typeof (value as { end?: unknown }).end === "string"
+  );
+};
+
+const isPersonList = (value: unknown): value is Person[] => {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+
+  return value.every((person) => {
+    if (typeof person !== "object" || person === null) {
+      return false;
     }
 
-    return createDefaultPeople();
+    const candidate = person as {
+      id?: unknown;
+      name?: unknown;
+      availability?: unknown;
+    };
+
+    return (
+      typeof candidate.id === "number" &&
+      typeof candidate.name === "string" &&
+      typeof candidate.availability === "object" &&
+      candidate.availability !== null &&
+      days.every((day) =>
+        isDailyAvailability(
+          (candidate.availability as Record<string, unknown>)[day],
+        ),
+      )
+    );
   });
+};
+
+const App = () => {
+  const [people, setPeople] = useState<Person[]>(() => createDefaultPeople());
+  const [syncState, setSyncState] = useState<SyncState>("loading");
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const [realtimeState, setRealtimeState] =
+    useState<RealtimeState>("connecting");
+  const hydratedRef = useRef(false);
+  const lastSavedSnapshotRef = useRef<string>(
+    JSON.stringify(createDefaultPeople()),
+  );
+  const saveTimerRef = useRef<number | null>(null);
 
   const commonSlots = useMemo(() => findCommonSlots(people), [people]);
+
+  const syncLabel =
+    syncState === "live"
+      ? "Live shared board"
+      : syncState === "loading"
+        ? "Connecting"
+        : syncState === "offline"
+          ? "Local only"
+          : "Sync error";
+
+  const syncDescription =
+    syncState === "live"
+      ? "Everyone with the same board sees edits in real time."
+      : syncState === "loading"
+        ? "Loading the shared schedule..."
+        : syncState === "offline"
+          ? "Add Supabase env vars to turn on collaboration."
+          : (syncError ?? "Realtime sync could not connect right now.");
 
   const updatePersonName = (id: number, name: string) => {
     setPeople((currentPeople) =>
@@ -62,26 +128,176 @@ const App = () => {
   };
 
   const resetSchedule = () => {
-    try {
-      if (typeof window !== "undefined") {
-        localStorage.removeItem(STORAGE_KEY);
-      }
-    } catch (e) {
-      // ignore
-    }
-
+    lastSavedSnapshotRef.current = JSON.stringify(createDefaultPeople());
     setPeople(createDefaultPeople());
   };
 
-  // persist people whenever they change
   useEffect(() => {
-    try {
-      if (typeof window !== "undefined") {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(people));
-      }
-    } catch (e) {
-      // ignore storage errors
+    const sharedSupabase = supabase;
+
+    if (!sharedSupabase) {
+      hydratedRef.current = true;
+      setSyncState("offline");
+      setRealtimeState("connecting");
+      return;
     }
+
+    let active = true;
+
+    const loadSharedSchedule = async () => {
+      setSyncState("loading");
+
+      const { data, error } = await sharedSupabase
+        .from(TEAM_SCHEDULE_TABLE)
+        .select("people")
+        .eq("id", TEAM_SCHEDULE_ROW_ID)
+        .maybeSingle();
+
+      if (!active) {
+        return;
+      }
+
+      if (error && error.code !== "PGRST116") {
+        setSyncError(error.message);
+        setSyncState("error");
+        hydratedRef.current = true;
+        return;
+      }
+
+      const loadedPeople = isPersonList(data?.people) ? data.people : null;
+
+      if (loadedPeople) {
+        lastSavedSnapshotRef.current = JSON.stringify(loadedPeople);
+        setPeople(loadedPeople);
+      } else {
+        const defaultPeople = createDefaultPeople();
+        lastSavedSnapshotRef.current = JSON.stringify(defaultPeople);
+        setPeople(defaultPeople);
+
+        const { error: upsertError } = await sharedSupabase
+          .from(TEAM_SCHEDULE_TABLE)
+          .upsert({
+            id: TEAM_SCHEDULE_ROW_ID,
+            people: defaultPeople,
+          });
+
+        if (!active) {
+          return;
+        }
+
+        if (upsertError) {
+          setSyncError(upsertError.message);
+          setSyncState("error");
+          hydratedRef.current = true;
+          return;
+        }
+      }
+
+      hydratedRef.current = true;
+      setSyncState("live");
+    };
+
+    void loadSharedSchedule();
+
+    const channel = sharedSupabase
+      .channel(channelName)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: TEAM_SCHEDULE_TABLE,
+          filter: `id=eq.${TEAM_SCHEDULE_ROW_ID}`,
+        },
+        (payload) => {
+          const nextPeople = isPersonList(
+            (payload.new as { people?: unknown } | null)?.people,
+          )
+            ? (payload.new as { people: Person[] }).people
+            : null;
+
+          if (nextPeople) {
+            lastSavedSnapshotRef.current = JSON.stringify(nextPeople);
+            setPeople(nextPeople);
+            hydratedRef.current = true;
+            setSyncState("live");
+          }
+        },
+      )
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          setRealtimeState("subscribed");
+          return;
+        }
+
+        if (status === "TIMED_OUT") {
+          setRealtimeState("timed-out");
+          setSyncError(
+            "Realtime subscription timed out. Check table publication and network access.",
+          );
+          setSyncState("error");
+          return;
+        }
+
+        if (status === "CHANNEL_ERROR") {
+          setRealtimeState("channel-error");
+          setSyncError(
+            "Realtime channel error. Ensure the table is in the realtime publication.",
+          );
+          setSyncState("error");
+        }
+      });
+
+    return () => {
+      active = false;
+      void channel.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    const sharedSupabase = supabase;
+
+    if (!sharedSupabase || !hydratedRef.current) {
+      return;
+    }
+
+    const snapshot = JSON.stringify(people);
+
+    if (snapshot === lastSavedSnapshotRef.current) {
+      return;
+    }
+
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+    }
+
+    saveTimerRef.current = window.setTimeout(() => {
+      const persistSchedule = async () => {
+        const { error } = await sharedSupabase
+          .from(TEAM_SCHEDULE_TABLE)
+          .upsert({
+            id: TEAM_SCHEDULE_ROW_ID,
+            people,
+          });
+
+        if (error) {
+          setSyncError(error.message);
+          setSyncState("error");
+          return;
+        }
+
+        lastSavedSnapshotRef.current = snapshot;
+        setSyncState("live");
+      };
+
+      void persistSchedule();
+    }, 250);
+
+    return () => {
+      if (saveTimerRef.current !== null) {
+        window.clearTimeout(saveTimerRef.current);
+      }
+    };
   }, [people]);
 
   return (
@@ -91,12 +307,12 @@ const App = () => {
           <p className="eyebrow">LumenIT</p>
           <h1>Time Scheduler</h1>
           <p className="lede">
-            Enter start and end times for each day. Matching windows show
-            possible meeting days.
+            Enter start and end times for each day. Everyone can edit the same
+            board at the same time.
           </p>
         </div>
         <div className="hero-card">
-          <span>Team momentum</span>
+          <span>LumenIT momentum</span>
           <strong>Small wins — sync the team, keep moving forward.</strong>
         </div>
       </section>
