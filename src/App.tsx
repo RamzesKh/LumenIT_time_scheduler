@@ -165,7 +165,7 @@ const App = () => {
     }
 
     let active = true;
-
+    // Load the shared schedule from the database when the component mounts
     const loadSharedSchedule = async () => {
       setSyncState("loading");
 
