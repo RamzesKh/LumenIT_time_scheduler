@@ -128,8 +128,30 @@ const App = () => {
   };
 
   const resetSchedule = () => {
-    lastSavedSnapshotRef.current = JSON.stringify(createDefaultPeople());
-    setPeople(createDefaultPeople());
+    const defaultPeople = createDefaultPeople();
+    lastSavedSnapshotRef.current = JSON.stringify(defaultPeople);
+    setPeople(defaultPeople);
+
+    if (!supabase) {
+      return;
+    }
+
+    void supabase
+      .from(TEAM_SCHEDULE_TABLE)
+      .upsert({
+        id: TEAM_SCHEDULE_ROW_ID,
+        people: defaultPeople,
+      })
+      .then(({ error }) => {
+        if (error) {
+          setSyncError(error.message);
+          setSyncState("error");
+          return;
+        }
+
+        setSyncError(null);
+        setSyncState("live");
+      });
   };
 
   useEffect(() => {
